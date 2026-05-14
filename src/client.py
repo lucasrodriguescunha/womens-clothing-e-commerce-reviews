@@ -1,87 +1,106 @@
+import os
+import openai
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from openai import OpenAI
 from sklearn.manifold import TSNE
-from sklearn.metrics.pairwise import cosine_similarity
+import matplotlib.pyplot as plt
+import chromadb
+from scipy.spatial import distance
+from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 from dotenv import load_dotenv
 
-# ── Setup ──────────────────────────────────────────────────────────────────────
+# Load environment variables from .env (OPENAI_API_KEY)
 load_dotenv()
 
-client = OpenAI()
+EMBEDDING_MODEL = "text-embedding-3-small"
 
-reviews = pd.read_csv("womens_clothing_e-commerce_reviews.csv")
-review_texts = reviews["Review Text"].dropna().tolist()
+# Load dataset and drop rows with missing review text
+reviews = pd.read_csv("src/data/datalab_export_2026-05-12 16_27_43.csv")
+review_texts = reviews["Review Text"].dropna().reset_index(drop=True)
 
-# ── 1. Generate & store embeddings ────────────────────────────────────────────
-def get_embedding(text, model="text-embedding-3-small"):
-    text = text.replace("\n", " ")
-    return client.embeddings.create(input=[text], model=model).data[0].embedding
+# Generate embeddings for all reviews in a single API call
+openai_client = openai.OpenAI()
+responses = openai_client.embeddings.create(input=review_texts.tolist(), model=EMBEDDING_MODEL).model_dump()
+embeddings = [response["embedding"] for response in responses["data"]]
 
-embeddings = [get_embedding(text) for text in review_texts]
 
-# ── 2. Dimensionality reduction → 2D ──────────────────────────────────────────
-embeddings_array = np.array(embeddings)
+def apply_tsne(embeddings):
+    # Reduce high-dimensional embeddings to 2D for visualization
+    # perplexity must be less than n_samples
+    perplexity = min(30, len(embeddings) - 1)
+    tsne = TSNE(n_components=2, random_state=0, perplexity=perplexity)
+    return tsne.fit_transform(embeddings)
 
-tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
-embeddings_2d = tsne.fit_transform(embeddings_array)
+embeddings_2d = apply_tsne(np.array(embeddings))
 
-plt.figure(figsize=(12, 8))
-plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], alpha=0.5, s=10, c="steelblue")
-plt.title("2D Visualization of Women's Clothing Reviews (t-SNE)")
-plt.xlabel("Dimension 1")
-plt.ylabel("Dimension 2")
-plt.tight_layout()
-plt.savefig("reviews_tsne.png", dpi=150)
-plt.show()
 
-# ── 3. Categorize feedback by theme ───────────────────────────────────────────
-themes = {
-    "quality":  "The quality of this product is excellent and well made.",
-    "fit":      "This item fits perfectly, true to size.",
-    "style":    "This is very stylish and fashionable.",
-    "comfort":  "This is very comfortable to wear.",
-    "price":    "The price is great value for money.",
-}
+# Topics used to classify each review by semantic similarity
+categories = ["Quality", "Fit", "Style", "Comfort"]
 
-theme_embeddings = {theme: get_embedding(desc) for theme, desc in themes.items()}
+# Generate embeddings for category labels
+category_responses = openai_client.embeddings.create(input=categories, model=EMBEDDING_MODEL).model_dump()
+category_embeddings = [emb["embedding"] for emb in category_responses["data"]]
 
-def get_top_theme(review_embedding):
-    scores = {
-        theme: cosine_similarity([review_embedding], [emb])[0][0]
-        for theme, emb in theme_embeddings.items()
-    }
-    return max(scores, key=scores.get)
 
-categorized = pd.DataFrame({
-    "review":    review_texts[:50],   # sample first 50 for display
-    "theme":     [get_top_theme(embeddings[i]) for i in range(50)],
-})
+def categorize_feedback(text_embedding, category_embeddings):
+    # Assign the category whose embedding is closest (lowest cosine distance) to the review
+    similarities = [{"distance": distance.cosine(text_embedding, cat_emb), "index": i}
+                    for i, cat_emb in enumerate(category_embeddings)]
+    closest = min(similarities, key=lambda x: x["distance"])
+    return categories[closest["index"]]
 
-print("\nTheme distribution (first 50 reviews):")
-print(categorized["theme"].value_counts())
+# Classify every review into one of the four categories
+feedback_categories = [categorize_feedback(emb, category_embeddings) for emb in embeddings]
 
-# ── 4. Similarity search function ─────────────────────────────────────────────
-def find_similar_reviews(input_review, top_n=3):
-    """Return top_n most similar reviews to input_review."""
-    input_emb = np.array(get_embedding(input_review)).reshape(1, -1)
-    sims = cosine_similarity(input_emb, embeddings_array)[0]
-    # Exclude exact match (index 0 if input is review_texts[0])
-    top_indices = np.argsort(sims)[::-1]
-    results = []
-    for idx in top_indices:
-        if review_texts[idx] != input_review:
-            results.append(review_texts[idx])
-        if len(results) == top_n:
-            break
+
+def plot_tsne(tsne_results, labels=None):
+    # Plot 2D t-SNE projection; color points by category label when provided
+    plt.figure(figsize=(12, 8))
+    if labels:
+        unique_labels = list(set(labels))
+        colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels)))
+        color_map = {label: colors[i] for i, label in enumerate(unique_labels)}
+        for label in unique_labels:
+            indices = [i for i, l in enumerate(labels) if l == label]
+            pts = tsne_results[indices]
+            plt.scatter(pts[:, 0], pts[:, 1], alpha=0.5, label=label, color=color_map[label])
+        plt.legend()
+    else:
+        plt.scatter(tsne_results[:, 0], tsne_results[:, 1], alpha=0.5)
+    plt.title("t-SNE Visualization of Review Embeddings")
+    plt.xlabel("t-SNE feature 1")
+    plt.ylabel("t-SNE feature 2")
+    plt.show()
+
+plot_tsne(embeddings_2d, labels=feedback_categories)
+
+
+# Initialize persistent ChromaDB client for vector storage
+chroma_client = chromadb.PersistentClient()
+
+# Create collection with OpenAI embedding function so ChromaDB embeds queries automatically
+review_embeddings_db = chroma_client.create_collection(
+    name="review_embeddings",
+    embedding_function=OpenAIEmbeddingFunction(model_name=EMBEDDING_MODEL, api_key=os.environ["OPENAI_API_KEY"]))
+
+# Store all review texts; ChromaDB will embed them using the collection's embedding function
+review_embeddings_db.add(
+    documents=review_texts.tolist(),
+    ids=[str(i) for i in range(len(review_texts))]
+)
+
+
+def find_similar_reviews(input_text, n=3):
+    # Query the vector DB for the n most semantically similar reviews
+    collection = chroma_client.get_collection(
+        name="review_embeddings",
+        embedding_function=OpenAIEmbeddingFunction(model_name=EMBEDDING_MODEL, api_key=os.environ["OPENAI_API_KEY"]))
+    results = collection.query(query_texts=[input_text], n_results=n)
     return results
 
-first_review = "Absolutely wonderful - silky and sexy and comfortable"
-most_similar_reviews = find_similar_reviews(first_review)
+example_review = "Absolutely wonderful - silky and sexy and comfortable"
+most_similar_reviews = find_similar_reviews(example_review, 3)["documents"][0]
+print(most_similar_reviews)
 
-print("\nFirst review:")
-print(f"  {first_review}")
-print("\n3 most similar reviews:")
-for i, r in enumerate(most_similar_reviews, 1):
-    print(f"  {i}. {r[:120]}...")
+# Remove collection to avoid duplicate key error on next run
+chroma_client.delete_collection(name="review_embeddings")
